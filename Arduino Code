@@ -1,0 +1,296 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// Using legacy Firebase ESP32 library API (FirebaseESP32.h)
+// Arduino IDE: Tools -> Manage Libraries -> Search "Firebase ESP32 Client" by mobizt
+#include <FirebaseESP32.h>
+
+// =====================
+// User Configuration
+// =====================
+static const char* WIFI_SSID = "YGlobeAtHome_259a8_2.4";
+static const char* WIFI_PASSWORD = "PXhsUbp4";
+
+// Firebase project settings
+// Get API key from Firebase console -> Project settings -> General -> Web API Key
+static const char* FIREBASE_API_KEY = "YOUR_FIREBASE_API_KEY";
+// Database URL looks like: https://<project-id>-default-rtdb.firebaseio.com/
+static const char* FIREBASE_DATABASE_URL = "https://YOUR_DATABASE_URL/";
+
+// =====================
+// Hardware Pin Mapping (adjust to your retrofit wiring)
+// =====================
+static const int PIN_RELAY_BREW = 26;     // Relay controlling brew switch/AC line
+static const int PIN_RELAY_HEATER = 27;   // Optional: heater relay (if separately controlled)
+static const int PIN_VALVE = 25;          // Optional: solenoid valve
+static const int PIN_WATER_LEVEL = 34;    // Analog water level sensor (0-4095)
+// Note: Use proper isolation/relays for AC equipment. Safety first.
+
+// =====================
+// Brew Settings (fallback defaults; overridable via Firebase)
+// =====================
+static unsigned long DEFAULT_BREW_MILLIS = 120000; // 2 minutes
+static int WATER_LOW_THRESHOLD = 500;              // ADC threshold; tune per sensor
+
+// =====================
+// Firebase and Time Globals
+// =====================
+FirebaseData fbdo;
+FirebaseData stream;
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60 * 1000); // sync every 60s
+
+// =====================
+// Realtime Database Paths
+// =====================
+static const char* PATH_CMD_BREW_NOW = "/coffee/command/brewNow";                // bool
+static const char* PATH_SCHEDULE_NEXT = "/coffee/schedule/nextBrewEpoch";        // int64 epoch secs
+static const char* PATH_SETTINGS_BREW_MS = "/coffee/settings/brewMillis";         // int ms
+static const char* PATH_STATE = "/coffee/state";                                  // object
+static const char* PATH_HISTORY = "/coffee/history";                              // push list
+static const char* PATH_NOTIF = "/coffee/notifications/message";                  // string
+static const char* PATH_ROOT_STREAM = "/coffee";                                   // stream root
+
+// =====================
+// Runtime State
+// =====================
+bool isBrewing = false;
+unsigned long brewEndMillis = 0;
+unsigned long lastScheduleCheckMs = 0;
+unsigned long scheduleCheckIntervalMs = 2000; // 2 seconds
+
+// =====================
+// Utility
+// =====================
+static inline void setRelay(int pin, bool on) {
+	digitalWrite(pin, on ? LOW : HIGH); // assuming active LOW relay modules
+}
+
+static inline long getEpoch() {
+	return timeClient.getEpochTime();
+}
+
+static inline int readWaterLevel() {
+	return analogRead(PIN_WATER_LEVEL);
+}
+
+static void sendNotification(const String& msg) {
+	Firebase.setString(fbdo, PATH_NOTIF, msg);
+}
+
+static void updateState(bool waterLow) {
+	FirebaseJson json;
+	json.set("isBrewing", isBrewing);
+	json.set("lastBrewEpoch", getEpoch());
+	json.set("waterLow", waterLow);
+	json.set("waterLevelRaw", readWaterLevel());
+	Firebase.updateNode(fbdo, PATH_STATE, json);
+}
+
+static void pushHistory(const String& event, bool success, const String& detail) {
+	FirebaseJson json;
+	json.set("event", event);
+	json.set("success", success);
+	json.set("detail", detail);
+	json.set("timestamp", getEpoch());
+	Firebase.pushJSON(fbdo, PATH_HISTORY, json);
+}
+
+static bool loadRemoteSettings() {
+	if (Firebase.getInt(fbdo, PATH_SETTINGS_BREW_MS)) {
+		DEFAULT_BREW_MILLIS = (unsigned long)fbdo.intData();
+	}
+	return true;
+}
+
+// =====================
+// Brew Control
+// =====================
+static bool canBrewNow(String& reason) {
+	const int level = readWaterLevel();
+	if (level < WATER_LOW_THRESHOLD) {
+		reason = "Water low";
+		return false;
+	}
+	if (isBrewing) {
+		reason = "Already brewing";
+		return false;
+	}
+	return true;
+}
+
+static void startBrew(unsigned long durationMs) {
+	isBrewing = true;
+	brewEndMillis = millis() + durationMs;
+	setRelay(PIN_RELAY_BREW, true);
+	setRelay(PIN_RELAY_HEATER, true);
+	setRelay(PIN_VALVE, true);
+	updateState(false);
+	sendNotification("Brew started");
+	pushHistory("brew_start", true, String("durationMs=") + durationMs);
+}
+
+static void stopBrew() {
+	setRelay(PIN_VALVE, false);
+	setRelay(PIN_RELAY_HEATER, false);
+	setRelay(PIN_RELAY_BREW, false);
+	isBrewing = false;
+	updateState(readWaterLevel() < WATER_LOW_THRESHOLD);
+	sendNotification("Brew finished");
+	pushHistory("brew_stop", true, "done");
+}
+
+static void handleBrewNowCommand() {
+	if (!Firebase.getBool(fbdo, PATH_CMD_START_BREW)) return;
+	bool brewNow = fbdo.boolData();
+	if (brewNow) {
+		String reason;
+		if (canBrewNow(reason)) {
+			loadRemoteSettings();
+			startBrew(DEFAULT_BREW_MILLIS);
+			Firebase.setBool(fbdo, PATH_CMD_START_BREW, false); // auto-reset
+		} else {
+			sendNotification(String("Cannot brew: ") + reason);
+			pushHistory("brew_rejected", false, reason);
+			Firebase.setBool(fbdo, PATH_CMD_START_BREW, false);
+		}
+	}
+}
+
+static void checkSchedule() {
+	if (millis() - lastScheduleCheckMs < scheduleCheckIntervalMs) return;
+	lastScheduleCheckMs = millis();
+	if (Firebase.getInt(fbdo, PATH_SCHEDULE_NEXT)) {
+		long nextEpoch = fbdo.intData();
+		if (nextEpoch > 0 && getEpoch() >= nextEpoch) {
+			String reason;
+			if (canBrewNow(reason)) {
+				loadRemoteSettings();
+				startBrew(DEFAULT_BREW_MILLIS);
+				Firebase.setInt(fbdo, PATH_SCHEDULE_NEXT, 0); // clear schedule
+				pushHistory("schedule_triggered", true, "started by scheduler");
+			} else {
+				pushHistory("schedule_skipped", false, reason);
+				sendNotification(String("Schedule skipped: ") + reason);
+				Firebase.setInt(fbdo, PATH_SCHEDULE_NEXT, 0);
+			}
+		}
+	}
+}
+
+// =====================
+// Stream Callback (legacy API)
+// =====================
+static void streamCallback(StreamData data) {
+	if (data.dataPath() == String("/command/StartBrew")) {
+		handleBrewNowCommand();
+	}
+}
+
+static void streamTimeoutCallback(bool timeout) {
+	if (timeout) {
+		Serial.println("[Stream] Timeout, resuming...");
+	}
+}
+
+// =====================
+// Setup / Loop
+// =====================
+static void connectWiFi() {
+	Serial.print("Connecting WiFi");
+	WiFi.mode(WIFI_STA);
+	WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+	unsigned long t0 = millis();
+	while (WiFi.status() != WL_CONNECTED) {
+		Serial.print('.');
+		delay(500);
+		if (millis() - t0 > 30000) break;
+	}
+	Serial.println();
+	Serial.println(WiFi.localIP());
+}
+
+static void connectFirebase() {
+	// For legacy library, minimally start Firebase client (WiFi must be connected)
+	Firebase.reconnectWiFi(true);
+
+	// Subscribe to command changes under the root path
+	if (!Firebase.beginStream(stream, PATH_ROOT_STREAM)) {
+		Serial.printf("Stream begin error: %s\n", stream.errorReason().c_str());
+	} else {
+		Firebase.setStreamCallback(stream, streamCallback, streamTimeoutCallback);
+	}
+}
+
+void setup() {
+	Serial.begin(115200);
+
+	pinMode(PIN_RELAY_BREW, OUTPUT);
+	pinMode(PIN_RELAY_HEATER, OUTPUT);
+	pinMode(PIN_VALVE, OUTPUT);
+	pinMode(PIN_WATER_LEVEL, INPUT);
+
+	// Ensure relays are off
+	setRelay(PIN_RELAY_BREW, false);
+	setRelay(PIN_RELAY_HEATER, false);
+	setRelay(PIN_VALVE, false);
+
+	connectWiFi();
+	timeClient.begin();
+	while (!timeClient.update()) {
+		timeClient.forceUpdate();
+		delay(250);
+	}
+
+	connectFirebase();
+	loadRemoteSettings();
+	updateState(readWaterLevel() < WATER_LOW_THRESHOLD);
+}
+
+void loop() {
+	timeClient.update();
+
+	// Manage brewing lifecycle
+	if (isBrewing && millis() >= brewEndMillis) {
+		stopBrew();
+	}
+
+	// Handle commands and schedule
+	handleBrewNowCommand();
+	checkSchedule();
+
+	// Periodically refresh settings
+	static unsigned long lastSettingsMs = 0;
+	if (millis() - lastSettingsMs > 30000) {
+		lastSettingsMs = millis();
+		loadRemoteSettings();
+		updateState(readWaterLevel() < WATER_LOW_THRESHOLD);
+	}
+
+	delay(50);
+}
+
+// =====================
+// Example Firebase Data Model (for reference)
+// =====================
+// /coffee/
+//   command/
+//     brewNow: false
+//   schedule/
+//     nextBrewEpoch: 0
+//   settings/
+//     brewMillis: 120000
+//   state/
+//     isBrewing: false
+//     lastBrewEpoch: 0
+//     waterLow: false
+//     waterLevelRaw: 0
+//   notifications/
+//     message: ""
+//   history/
+//     -Kxyz123: { event, success, detail, timestamp }
+
+
