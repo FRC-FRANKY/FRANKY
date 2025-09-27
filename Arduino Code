@@ -144,18 +144,18 @@ static void stopBrew() {
 }
 
 static void handleBrewNowCommand() {
-	if (!Firebase.getBool(fbdo, PATH_CMD_START_BREW)) return;
+	if (!Firebase.getBool(fbdo, PATH_CMD_BREW_NOW)) return;
 	bool brewNow = fbdo.boolData();
 	if (brewNow) {
 		String reason;
 		if (canBrewNow(reason)) {
 			loadRemoteSettings();
 			startBrew(DEFAULT_BREW_MILLIS);
-			Firebase.setBool(fbdo, PATH_CMD_START_BREW, false); // auto-reset
+			Firebase.setBool(fbdo, PATH_CMD_BREW_NOW, false); // auto-reset
 		} else {
 			sendNotification(String("Cannot brew: ") + reason);
 			pushHistory("brew_rejected", false, reason);
-			Firebase.setBool(fbdo, PATH_CMD_START_BREW, false);
+			Firebase.setBool(fbdo, PATH_CMD_BREW_NOW, false);
 		}
 	}
 }
@@ -185,7 +185,7 @@ static void checkSchedule() {
 // Stream Callback (legacy API)
 // =====================
 static void streamCallback(StreamData data) {
-	if (data.dataPath() == String("/command/StartBrew")) {
+	if (data.dataPath() == String("/command/brewNow")) {
 		handleBrewNowCommand();
 	}
 }
